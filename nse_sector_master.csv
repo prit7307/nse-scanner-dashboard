@@ -1,0 +1,37 @@
+SYMBOL,SECTOR,INDUSTRY
+BEL,Capital Goods & Defence,Aerospace & Defence
+HAL,Capital Goods & Defence,Aerospace & Defence
+POLYCAB,Capital Goods & Defence,Cables & Wires
+LT,Capital Goods & Defence,Civil Engineering & Construction
+BHEL,Capital Goods & Defence,Heavy Electrical Equipment
+DIXON,Consumer Durables,Consumer Electronics
+HAVELLS,Consumer Durables,Domestic Appliances
+VOLTAS,Consumer Durables,Air Conditioning
+TRENT,Consumer Discretionary,Apparel Retail
+KALYANKJIL,Consumer Discretionary,Gems & Jewellery
+TITAN,Consumer Discretionary,Gems & Jewellery
+HDFCBANK,Financial Services,Private Sector Bank
+ICICIBANK,Financial Services,Private Sector Bank
+SBIN,Financial Services,Public Sector Bank
+KOTAKBANK,Financial Services,Private Sector Bank
+BAJFINANCE,Financial Services,Non Banking Financial Company
+INFY,Information Technology,IT Consulting & Software
+TCS,Information Technology,IT Consulting & Software
+PERSISTENT,Information Technology,Software Products
+WIPRO,Information Technology,IT Consulting & Software
+TATAPOWER,Energy & Utilities,Electric Utilities
+NTPC,Energy & Utilities,Electric Utilities
+POWERGRID,Energy & Utilities,Electric Transmission
+CHAMBLFERT,Chemicals & Fertilizers,Fertilizers
+DEEPAKNTR,Chemicals & Fertilizers,Specialty Chemicals
+SRF,Chemicals & Fertilizers,Specialty Chemicals
+CIPLA,Healthcare & Pharma,Pharmaceuticals
+SUNPHARMA,Healthcare & Pharma,Pharmaceuticals
+DRREDDY,Healthcare & Pharma,Pharmaceuticals
+MARUTI,Automobile,Passenger Cars
+TATAMOTORS,Automobile,Commercial & Passenger Vehicles
+M&M,Automobile,Passenger Vehicles & Farm Equipment
+TATASTEEL,Metals & Mining,Iron & Steel
+JSWSTEEL,Metals & Mining,Iron & Steel
+ITC,FMCG,Diversified FMCG
+HINDUNILVR,FMCG,Personal & Household Products
