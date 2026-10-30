@@ -4,10 +4,10 @@ on:
   schedule:
     # 13:00 UTC = 18:30 IST (Monday through Friday)
     - cron: '0 13 * * 1-5'
-  workflow_dispatch: # Allows manual one-click trigger anytime from GitHub
+  workflow_dispatch: # Allows manual run button
 
 permissions:
-  contents: write # Allows GitHub Actions to commit updated data
+  contents: write
 
 jobs:
   sync-nse-data:
@@ -15,6 +15,9 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -24,15 +27,20 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          pip install --upgrade pip
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Holiday-Resilient Sync Script
+      - name: Run Sync Script
         run: python update_data.py
 
       - name: Commit and Push Updated Parquet History
         run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
           git add data/nse_rolling_60d.parquet
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Automated daily NSE update [skip ci]" && git push)
+          if git diff --staged --quiet; then
+            echo "No changes to commit. Data is already up to date."
+          else
+            git commit -m "Automated daily NSE data sync [skip ci]"
+            git push origin main
+          fi
