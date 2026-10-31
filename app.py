@@ -31,83 +31,102 @@ def load_and_process_data():
 
     df = pd.read_parquet(file_path)
     
-    col_map = {c: c.strip().upper() for c in df.columns}
-    df.rename(columns=col_map, inplace=True)
+    # Standardize column headers to uppercase
+    df.columns = [c.strip().upper() for c in df.columns]
 
-    # 1. Symbol column
-    symbol_col = next((c for c in ['SYMBOL', 'TCKRSYMB', 'STOCK'] if c in df.columns), df.columns[0])
-    df.rename(columns={symbol_col: 'SYMBOL'}, inplace=True)
-
-    # 2. Date column and filter latest date
+    # Identify primary columns
+    sym_col = next((c for c in ['SYMBOL', 'TCKRSYMB', 'STOCK'] if c in df.columns), df.columns[0])
     date_col = next((c for c in ['DATE', 'TIMESTAMP', 'TRADING_DATE', 'DATETIME'] if c in df.columns), None)
+    close_col = next((c for c in ['CLOSE', 'CLOSE_PRICE', 'LT_PRICE', 'LTP'] if c in df.columns), None)
+    deliv_col = next((c for c in ['DELIV_QTY', 'DELIVERY_QTY', 'TTL_TRD_QNTY'] if c in df.columns), None)
+    high_col = next((c for c in ['HIGH', 'HIGH_PRICE'] if c in df.columns), None)
+    low_col = next((c for c in ['LOW', 'LOW_PRICE'] if c in df.columns), None)
+
+    df.rename(columns={sym_col: 'SYMBOL'}, inplace=True)
+
+    # Filter equity series
+    if 'SERIES' in df.columns:
+        df = df[df['SERIES'].isin(['EQ', 'BE'])]
+
+    # Clean numeric fields
+    for col in [close_col, deliv_col, high_col, low_col]:
+        if col:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    # If dataset already has pre-computed DSI and Price Change columns, use them directly
+    has_precomputed_dsi = any(c in df.columns for c in ['DELIVERY SURGE INDEX (X 50D AVG)', 'DELIVERY_SURGE_INDEX', 'DSI'])
+    has_precomputed_pct = any(c in df.columns for c in ['PRICE CHANGE (%)', 'PRICE_CHANGE_PCT', 'PCT_CHG'])
+
     if date_col:
         df[date_col] = pd.to_datetime(df[date_col])
         df = df.sort_values(by=['SYMBOL', date_col])
+
+        if not has_precomputed_dsi and deliv_col:
+            # Compute 50-day rolling delivery mean per stock
+            df['DELIV_50SMA'] = df.groupby('SYMBOL')[deliv_col].transform(
+                lambda x: x.rolling(50, min_periods=5).mean()
+            )
+            df['Delivery Surge Index (x 50D Avg)'] = (
+                df[deliv_col] / df['DELIV_50SMA'].replace(0, np.nan)
+            ).round(2)
+
+        if not has_precomputed_pct and close_col:
+            # Compute true 1-day percentage return from previous session's close
+            df['PREV_CLOSE_CALC'] = df.groupby('SYMBOL')[close_col].shift(1)
+            valid_base = (df['PREV_CLOSE_CALC'] >= 0.50) & (df['PREV_CLOSE_CALC'].notna())
+            df['Price Change (%)'] = np.where(
+                valid_base,
+                ((df[close_col] - df['PREV_CLOSE_CALC']) / df['PREV_CLOSE_CALC']) * 100.0,
+                0.0
+            )
+
+        # Keep only the latest trading session
         latest_date = df[date_col].max()
         latest_df = df[df[date_col] == latest_date].copy()
     else:
         latest_df = df.copy()
 
-    # 3. Filter series
-    if 'SERIES' in latest_df.columns:
-        latest_df = latest_df[latest_df['SERIES'].isin(['EQ', 'BE'])]
+    # Fallback column mapping if precomputed
+    if 'Price Change (%)' not in latest_df.columns:
+        for c in ['PRICE CHANGE (%)', 'PRICE_CHANGE_PCT', 'PCT_CHG']:
+            if c in latest_df.columns:
+                latest_df['Price Change (%)'] = pd.to_numeric(latest_df[c], errors='coerce')
+                break
 
-    # 4. Close column
-    close_col = next((c for c in ['CLOSE', 'CLOSE_PRICE', 'LT_PRICE', 'LTP'] if c in latest_df.columns), None)
-    if close_col:
-        latest_df['CLOSE'] = pd.to_numeric(latest_df[close_col], errors='coerce')
-    else:
-        latest_df['CLOSE'] = 0.0
+    if 'Delivery Surge Index (x 50D Avg)' not in latest_df.columns:
+        for c in ['DELIVERY SURGE INDEX (X 50D AVG)', 'DELIVERY_SURGE_INDEX', 'DSI']:
+            if c in latest_df.columns:
+                latest_df['Delivery Surge Index (x 50D Avg)'] = pd.to_numeric(latest_df[c], errors='coerce')
+                break
 
-    # 5. Price Change (%)
-    pct_col = next((c for c in ['PRICE CHANGE (%)', 'PRICE_CHANGE_PCT', 'PCT_CHG', 'CHG_PCT', 'RETURN'] if c in latest_df.columns), None)
-    if pct_col:
-        latest_df['Price Change (%)'] = pd.to_numeric(latest_df[pct_col], errors='coerce')
-    else:
-        prevclose_col = next((c for c in ['PREVCLOSE', 'PREV_CLOSE', 'OPEN'] if c in latest_df.columns), None)
-        if prevclose_col and close_col:
-            base = pd.to_numeric(latest_df[prevclose_col], errors='coerce')
-            valid_base = (base.notna()) & (base >= 0.50)
-            latest_df['Price Change (%)'] = np.where(
-                valid_base,
-                ((latest_df['CLOSE'] - base) / base) * 100.0,
-                0.0
-            )
-        else:
-            latest_df['Price Change (%)'] = 0.0
+    if close_col and 'CLOSE' not in latest_df.columns:
+        latest_df['CLOSE'] = latest_df[close_col]
+    if deliv_col and 'DELIV_QTY' not in latest_df.columns:
+        latest_df['DELIV_QTY'] = latest_df[deliv_col]
 
-    # Sanitize ACCURACY / Penny Stock Outliers
+    # Defaults for missing data
+    latest_df['Price Change (%)'] = latest_df['Price Change (%)'].fillna(0.0)
+    latest_df['Delivery Surge Index (x 50D Avg)'] = latest_df['Delivery Surge Index (x 50D Avg)'].fillna(1.0)
+    latest_df['DELIV_QTY'] = latest_df['DELIV_QTY'].fillna(0)
+
+    # --- ANOMALY ELIMINATION (ACCURACY & OTHER PENNY GLITCHES) ---
     latest_df = latest_df[
-        (latest_df['Price Change (%)'].notna()) &
-        (latest_df['Price Change (%)'].between(-30.0, 100.0))
+        (latest_df['Price Change (%)'].between(-30.0, 100.0)) &
+        (latest_df['Delivery Surge Index (x 50D Avg)'] > 0.05)
     ]
 
-    # 6. Delivery Surge Index (DSI)
-    dsi_col = next((c for c in ['DELIVERY SURGE INDEX (X 50D AVG)', 'DELIVERY_SURGE_INDEX', 'DSI', 'SURGE_INDEX'] if c in latest_df.columns), None)
-    if dsi_col:
-        latest_df['Delivery Surge Index (x 50D Avg)'] = pd.to_numeric(latest_df[dsi_col], errors='coerce').fillna(1.0)
-    else:
-        latest_df['Delivery Surge Index (x 50D Avg)'] = 1.0
-
-    # 7. Deliverable Quantity
-    deliv_col = next((c for c in ['DELIV_QTY', 'DELIVERY_QTY', 'TTL_TRD_QNTY', 'VOLUME'] if c in latest_df.columns), None)
-    if deliv_col:
-        latest_df['DELIV_QTY'] = pd.to_numeric(latest_df[deliv_col], errors='coerce').fillna(0)
-    else:
-        latest_df['DELIV_QTY'] = 0
-
-    # 8. Accumulation Alert
+    # Accumulation Alert
     latest_df['Accumulation_Alert'] = np.where(
         latest_df['Delivery Surge Index (x 50D Avg)'] >= 2.0,
         'DELIVERY SURGE',
         'NEUTRAL'
     )
 
-    # 9. Sector Mapping
-    sector_path = "nse_sector_master.csv"
-    if os.path.exists(sector_path) and 'SECTOR' not in latest_df.columns:
+    # Sector Master mapping
+    sector_file = "nse_sector_master.csv"
+    if os.path.exists(sector_file) and 'SECTOR' not in latest_df.columns:
         try:
-            sec_df = pd.read_csv(sector_path)
+            sec_df = pd.read_csv(sector_file)
             sec_df.columns = [c.strip().upper() for c in sec_df.columns]
             if 'SYMBOL' in sec_df.columns and 'SECTOR' in sec_df.columns:
                 latest_df = pd.merge(latest_df, sec_df[['SYMBOL', 'SECTOR']], on='SYMBOL', how='left')
@@ -119,11 +138,11 @@ def load_and_process_data():
     else:
         latest_df['SECTOR'] = latest_df['SECTOR'].fillna('Broad Market / Small & Mid')
 
-    # 10. NR7 squeeze check
+    # NR7 Volatility Squeeze
     if 'IS_NR7' not in latest_df.columns:
-        if all(c in latest_df.columns for c in ['HIGH', 'LOW', 'CLOSE']):
-            rng = pd.to_numeric(latest_df['HIGH'], errors='coerce') - pd.to_numeric(latest_df['LOW'], errors='coerce')
-            latest_df['IS_NR7'] = (rng < (latest_df['CLOSE'] * 0.015)).astype(int)
+        if high_col and low_col and close_col:
+            rng = latest_df[high_col] - latest_df[low_col]
+            latest_df['IS_NR7'] = (rng < (latest_df[close_col] * 0.015)).astype(int)
         else:
             latest_df['IS_NR7'] = 0
 
@@ -143,11 +162,7 @@ default_sectors = [s for s in ['Automobile', 'Broad Market / Small & Mid', 'Capi
 if not default_sectors and all_sectors:
     default_sectors = all_sectors[:5]
 
-selected_sectors = st.sidebar.multiselect(
-    "Filter by Sector:",
-    options=all_sectors,
-    default=default_sectors
-)
+selected_sectors = st.sidebar.multiselect("Filter by Sector:", options=all_sectors, default=default_sectors)
 
 min_dsi = st.sidebar.slider("Min Delivery Surge Index (DSI):", min_value=0.5, max_value=5.0, value=1.00, step=0.1)
 show_nr7_only = st.sidebar.checkbox("Show Only NR7 Squeeze Stocks", value=False)
@@ -191,10 +206,6 @@ with tab1:
     st.subheader("Delivery Surge Index vs. Price Action")
 
     if not filtered_df.empty:
-        pct_values = filtered_df['Price Change (%)'].dropna()
-        p_low = max(-20.0, float(np.percentile(pct_values, 1))) if len(pct_values) > 5 else -10.0
-        p_high = min(35.0, float(np.percentile(pct_values, 99)) + 2.0) if len(pct_values) > 5 else 20.0
-
         fig = px.scatter(
             filtered_df,
             x='Price Change (%)',
@@ -220,9 +231,14 @@ with tab1:
             marker=dict(size=9, opacity=0.85, line=dict(width=0.5, color='white'))
         )
 
+        # Automatic scaling with dynamic padding so points are always centered
+        x_min = float(filtered_df['Price Change (%)'].min()) - 1.5
+        x_max = float(filtered_df['Price Change (%)'].max()) + 1.5
+        y_max = float(filtered_df['Delivery Surge Index (x 50D Avg)'].max()) * 1.08
+
         fig.update_xaxes(
             title_text="Price Change (%)",
-            range=[p_low, max(p_high, 15.0)],
+            range=[min(-5.0, x_min), max(10.0, x_max)],
             zeroline=True,
             zerolinecolor='#444',
             gridcolor='#222'
@@ -230,6 +246,7 @@ with tab1:
 
         fig.update_yaxes(
             title_text="Delivery Surge Index (x 50D Avg)",
+            range=[0.8, max(2.5, y_max)],
             zeroline=True,
             zerolinecolor='#444',
             gridcolor='#222'
