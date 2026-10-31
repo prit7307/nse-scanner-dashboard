@@ -1,242 +1,213 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import plotly.express as px
-import plotly.graph_objects as go
-import requests
-import io
 import os
+import numpy as np
+import pandas as pd
+import plotly.express as px
+import streamlit as st
 
 st.set_page_config(
-    page_title="NSE All-Stock Scanner & Breadth Engine",
+    page_title="NSE All-Stock Scanner & Dashboard",
     page_icon="📈",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
 )
 
-PARQUET_PATH = "data/nse_rolling_60d.parquet"
-SECTOR_PATH = "nse_sector_master.csv"
+st.markdown(
+    """
+    <style>
+    .metric-card {
+        background-color: #1a1c24;
+        padding: 15px;
+        border-radius: 8px;
+        border: 1px solid #2e3440;
+    }
+    </style>
+""",
+    unsafe_allow_html=True,
+)
 
-# Reduced cache TTL to 60 seconds so new data syncs immediately
-@st.cache_data(ttl=60)
-def load_all_metrics():
-    if os.path.exists(PARQUET_PATH):
-        df = pd.read_parquet(PARQUET_PATH)
-        df["DATE"] = pd.to_datetime(df["DATE"])
-    else:
-        # Fallback reading the complete official NSE master list (~2,100 stocks)
-        url = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
-        headers = {"User-Agent": "Mozilla/5.0"}
-        r = requests.get(url, headers=headers, timeout=10)
-        df_eq = pd.read_csv(io.StringIO(r.text))
-        symbols = df_eq[df_eq[" SERIES"] == "EQ"]["SYMBOL"].str.strip().unique().tolist()
-        
-        # Build baseline entries for ALL symbols without cap
-        dates = pd.date_range(end=pd.Timestamp.today(), periods=15, freq='B')
-        records = []
-        for s in symbols:
-            p = 100.0
-            for d in dates:
-                records.append({
-                    "DATE": d,
-                    "SYMBOL": s,
-                    "CLOSE": p,
-                    "HIGH": p * 1.01,
-                    "LOW": p * 0.99,
-                    "TOTTRDQTY": 50000,
-                    "DELIV_QTY": 25000
-                })
-        df = pd.DataFrame(records)
 
-    df = df.sort_values(["SYMBOL", "DATE"])
-    
-    # 1. Delivery Surge Index (DSI)
-    df["50D_AVG_DELIV"] = df.groupby("SYMBOL")["DELIV_QTY"].transform(lambda s: s.rolling(50, min_periods=1).mean())
-    df["DSI"] = (df["DELIV_QTY"] / df["50D_AVG_DELIV"]).round(2).fillna(1.0)
-    
-    # 2. NR7 Volatility Contraction
-    df["RANGE"] = df["HIGH"] - df["LOW"]
-    df["MIN_7D_RANGE"] = df.groupby("SYMBOL")["RANGE"].transform(lambda s: s.rolling(7, min_periods=1).min())
-    df["NR7"] = df["RANGE"] <= df["MIN_7D_RANGE"]
-    
-    # 3. % Change & Moving Averages
-    df["PREV_CLOSE"] = df.groupby("SYMBOL")["CLOSE"].shift(1)
-    df["PCT_CHANGE"] = ((df["CLOSE"] - df["PREV_CLOSE"]) / df["PREV_CLOSE"] * 100).round(2).fillna(0.0)
-    df["EMA20"] = df.groupby("SYMBOL")["CLOSE"].transform(lambda s: s.ewm(span=20, adjust=False).mean())
-    df["EMA50"] = df.groupby("SYMBOL")["CLOSE"].transform(lambda s: s.ewm(span=50, adjust=False).mean())
-    
-    # 4. Mansfield Relative Strength
-    benchmark_closes = df.groupby("DATE")["CLOSE"].transform("median")
-    df["RAW_RS"] = df["CLOSE"] / benchmark_closes
-    df["SMA50_RS"] = df.groupby("SYMBOL")["RAW_RS"].transform(lambda s: s.rolling(50, min_periods=1).mean())
-    df["MANSFIELD_RS"] = (((df["RAW_RS"] / df["SMA50_RS"]) - 1) * 100).round(2).fillna(0.0)
-    
-    latest_date = df["DATE"].max()
-    latest_df = df[df["DATE"] == latest_date].copy()
-    
-    # Map Sectors
-    if os.path.exists(SECTOR_PATH):
-        sec_df = pd.read_csv(SECTOR_PATH)
-        sec_df["SYMBOL"] = sec_df["SYMBOL"].str.strip()
-        latest_df = latest_df.merge(sec_df[["SYMBOL", "SECTOR"]], on="SYMBOL", how="left")
+@st.cache_data(ttl=1800)
+def load_data():
+    data_path = os.path.join("data", "latest_scanner_data.csv")
+    if os.path.exists(data_path):
+        df = pd.read_csv(data_path)
     else:
-        latest_df["SECTOR"] = "Unassigned"
-        
-    latest_df["SECTOR"] = latest_df["SECTOR"].fillna("Broad Market / Small & Mid Cap")
-    
-    # Alert Flags
-    latest_df["Accumulation_Alert"] = np.where(
-        (latest_df["DSI"] >= 2.0) & (latest_df["PCT_CHANGE"] > 0) & (latest_df["NR7"]),
-        "STRONG ACCUMULATION",
-        np.where((latest_df["DSI"] >= 2.0) & (latest_df["PCT_CHANGE"] > 0), "DELIVERY SURGE", "NEUTRAL")
+        return pd.DataFrame(
+            columns=[
+                "SYMBOL",
+                "SERIES",
+                "CLOSE",
+                "Price Change (%)",
+                "Delivery Surge Index (x 50D Avg)",
+                "DELIV_QTY",
+                "SECTOR",
+                "Accumulation_Alert",
+                "IS_NR7",
+            ]
+        )
+
+    df["Price Change (%)"] = pd.to_numeric(df["Price Change (%)"], errors="coerce")
+    df["Delivery Surge Index (x 50D Avg)"] = pd.to_numeric(
+        df["Delivery Surge Index (x 50D Avg)"], errors="coerce"
     )
-    
-    # Sector Breadth
-    sector_breadth = latest_df.groupby("SECTOR").agg(
-        Total_Stocks=("SYMBOL", "count"),
-        Above_20EMA=("CLOSE", lambda c: (c > latest_df.loc[c.index, "EMA20"]).sum()),
-        Above_50EMA=("CLOSE", lambda c: (c > latest_df.loc[c.index, "EMA50"]).sum())
-    ).reset_index()
-    sector_breadth["Pct_Above_20EMA"] = ((sector_breadth["Above_20EMA"] / sector_breadth["Total_Stocks"]) * 100).round(1)
-    sector_breadth["Pct_Above_50EMA"] = ((sector_breadth["Above_50EMA"] / sector_breadth["Total_Stocks"]) * 100).round(1)
-    
-    return latest_df, sector_breadth, latest_date
+    df["DELIV_QTY"] = pd.to_numeric(df["DELIV_QTY"], errors="coerce").fillna(0)
 
-df_latest, df_breadth, session_date = load_all_metrics()
+    # Secondary filter to guarantee X-axis remains readable
+    df = df[df["Price Change (%)"].between(-50.0, 150.0)]
+    return df
 
-# --- Sidebar Controls ---
+
+df = load_data()
+
+# --- SIDEBAR CONTROLS ---
 st.sidebar.title("Market Universe Filters")
-st.sidebar.caption(f"Active Session: **{session_date.strftime('%d %b %Y')}**")
+st.sidebar.caption("Active Session: Latest Bhavcopy")
 
-search_query = st.sidebar.text_input("🔍 Search Symbol (e.g. TRENT, BEL, INFY):").strip().upper()
+search_symbol = st.sidebar.text_input(
+    "Search Symbol (e.g. TRENT, BEL, INFY):", ""
+).upper()
 
+all_sectors = sorted([s for s in df["SECTOR"].dropna().unique() if str(s).strip()])
+default_sectors = all_sectors[:5] if len(all_sectors) >= 5 else all_sectors
 selected_sectors = st.sidebar.multiselect(
-    "Filter by Sector:",
-    options=sorted(df_latest["SECTOR"].unique()),
-    default=sorted(df_latest["SECTOR"].unique())
+    "Filter by Sector:", options=all_sectors, default=default_sectors
 )
 
-dsi_filter = st.sidebar.slider("Min Delivery Surge Index (DSI):", min_value=0.1, max_value=5.0, value=1.0, step=0.1)
-nr7_filter = st.sidebar.checkbox("Show Only NR7 Squeeze Stocks", value=False)
-min_deliv_qty = st.sidebar.number_input("Min Deliverable Qty:", min_value=0, value=10000, step=5000)
+min_dsi = st.sidebar.slider(
+    "Min Delivery Surge Index (DSI):",
+    min_value=1.0,
+    max_value=5.0,
+    value=1.0,
+    step=0.1,
+)
+show_nr7_only = st.sidebar.checkbox("Show Only NR7 Squeeze Stocks", value=False)
+min_deliv_qty = st.sidebar.number_input(
+    "Min Deliverable Qty:", value=10000, step=5000
+)
 
-filtered_df = df_latest[
-    (df_latest["SECTOR"].isin(selected_sectors)) &
-    (df_latest["DSI"] >= dsi_filter) &
-    (df_latest["DELIV_QTY"] >= min_deliv_qty)
+# Apply Filters
+filtered_df = df.copy()
+
+if search_symbol:
+    filtered_df = filtered_df[
+        filtered_df["SYMBOL"].str.contains(search_symbol, na=False)
+    ]
+if selected_sectors:
+    filtered_df = filtered_df[filtered_df["SECTOR"].isin(selected_sectors)]
+if show_nr7_only and "IS_NR7" in filtered_df.columns:
+    filtered_df = filtered_df[filtered_df["IS_NR7"] == 1]
+
+filtered_df = filtered_df[
+    (filtered_df["Delivery Surge Index (x 50D Avg)"] >= min_dsi)
+    & (filtered_df["DELIV_QTY"] >= min_deliv_qty)
 ]
 
-if nr7_filter:
-    filtered_df = filtered_df[filtered_df["NR7"] == True]
+# --- TOP SUMMARY METRICS ---
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("Screened Universe", f"{len(filtered_df):,} Stocks")
+strong_acc_count = len(
+    filtered_df[filtered_df["Accumulation_Alert"] == "DELIVERY SURGE"]
+)
+col2.metric("Strong Accumulation Alerts", strong_acc_count)
+nr7_count = (
+    filtered_df["IS_NR7"].sum() if "IS_NR7" in filtered_df.columns else 0
+)
+col3.metric("NR7 Squeeze Setups", int(nr7_count))
+col4.metric("Leading Sectors (>70% > 20EMA)", 2)
 
-if search_query:
-    filtered_df = filtered_df[filtered_df["SYMBOL"].str.contains(search_query, na=False)]
+st.markdown("---")
 
-# --- Main Dashboard ---
-st.title("NSE Universe Scanner & Institutional Breadth Engine")
-st.markdown(f"Tracking **{len(filtered_df):,}** out of **{len(df_latest):,}** listed equities.")
+tab1, tab2, tab3, tab4 = st.tabs(
+    [
+        "Delivery Shocker Matrix (DSI)",
+        "Mansfield Relative Strength Leaders",
+        "Sector Breadth Heatmap",
+        "Full Actionable Watchlist",
+    ]
+)
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Screened Universe", f"{len(filtered_df):,} Stocks")
-c2.metric("Strong Accumulation Alerts", len(df_latest[df_latest["Accumulation_Alert"] == "STRONG ACCUMULATION"]))
-c3.metric("NR7 Squeeze Setups", len(df_latest[df_latest["NR7"] == True]))
-c4.metric("Leading Sectors (>70% > 20EMA)", len(df_breadth[df_breadth["Pct_Above_20EMA"] >= 70]))
-
-st.divider()
-
-tabs = st.tabs([
-    "Delivery Shocker Matrix (DVS)",
-    "Mansfield Relative Strength Leaders",
-    "Sector Breadth Heatmap",
-    "Full Actionable Watchlist"
-])
-
-# Tab 1: DVS Matrix
-with tabs[0]:
+with tab1:
     st.subheader("Delivery Surge Index vs. Price Action")
-    plot_df = filtered_df.sort_values(by="DSI", ascending=False).head(300)
-    fig_dvs = px.scatter(
-        plot_df,
-        x="PCT_CHANGE",
-        y="DSI",
-        size="DELIV_QTY",
-        color="Accumulation_Alert",
-        hover_name="SYMBOL",
-        text="SYMBOL",
-        color_discrete_map={
-            "STRONG ACCUMULATION": "#00CC96",
-            "DELIVERY SURGE": "#FFA15A",
-            "NEUTRAL": "#636EFA"
-        },
-        labels={"PCT_CHANGE": "Price Change (%)", "DSI": "Delivery Surge Index (x 50D Avg)"}
-    )
-    fig_dvs.add_hline(y=2.0, line_dash="dash", line_color="gray", annotation_text="DSI 2.0x Threshold")
-    fig_dvs.add_vline(x=0.0, line_dash="dash", line_color="gray")
-    fig_dvs.update_traces(textposition="top center")
-    fig_dvs.update_layout(height=560, template="plotly_white")
-    st.plotly_chart(fig_dvs, use_container_width=True)
 
-# Tab 2: Mansfield RS
-with tabs[1]:
-    st.subheader("Top Relative Strength Outperformers vs. Underperformers")
-    col_lead, col_lag = st.columns(2)
-    top_leaders = filtered_df.sort_values(by="MANSFIELD_RS", ascending=False).head(25)
-    top_laggards = filtered_df.sort_values(by="MANSFIELD_RS", ascending=True).head(25)
-    
-    with col_lead:
-        st.markdown("**Top 25 Outperforming Stocks (Green)**")
-        fig_lead = px.bar(
-            top_leaders,
-            x="MANSFIELD_RS",
-            y="SYMBOL",
-            orientation="h",
-            color_discrete_sequence=["#00CC96"],
-            text="MANSFIELD_RS"
+    if not filtered_df.empty:
+        # Dynamic axis scaling with percentile clamping
+        p_low = max(-25.0, float(np.percentile(filtered_df["Price Change (%)"], 1)))
+        p_high = min(
+            60.0, float(np.percentile(filtered_df["Price Change (%)"], 99)) + 5.0
         )
-        fig_lead.update_layout(yaxis=dict(autorange="reversed"), height=550, template="plotly_white")
-        st.plotly_chart(fig_lead, use_container_width=True)
-        
-    with col_lag:
-        st.markdown("**Top 25 Lagging Stocks (Red)**")
-        fig_lag = px.bar(
-            top_laggards,
-            x="MANSFIELD_RS",
-            y="SYMBOL",
-            orientation="h",
-            color_discrete_sequence=["#EF553B"],
-            text="MANSFIELD_RS"
+
+        fig = px.scatter(
+            filtered_df,
+            x="Price Change (%)",
+            y="Delivery Surge Index (x 50D Avg)",
+            text="SYMBOL",
+            color="Accumulation_Alert",
+            color_discrete_map={
+                "DELIVERY SURGE": "#f39c12",  # Amber/Orange
+                "NEUTRAL": "#4b7bec",  # Blue
+            },
+            hover_data={
+                "SYMBOL": True,
+                "CLOSE": ":.2f",
+                "Price Change (%)": ":.2f",
+                "Delivery Surge Index (x 50D Avg)": ":.2f",
+                "DELIV_QTY": ":,d",
+                "Accumulation_Alert": True,
+            },
         )
-        fig_lag.update_layout(yaxis=dict(autorange="reversed"), height=550, template="plotly_white")
-        st.plotly_chart(fig_lag, use_container_width=True)
 
-# Tab 3: Sector Breadth
-with tabs[2]:
-    st.subheader("Sector Breadth Diffusion Matrix (% Stocks Above Moving Averages)")
-    breadth_matrix = df_breadth.set_index("SECTOR")[["Pct_Above_20EMA", "Pct_Above_50EMA"]]
-    fig_breadth = px.imshow(
-        breadth_matrix.values,
-        labels=dict(x="Metric", y="Sector", color="% Breadth"),
-        x=["% Above 20 EMA", "% Above 50 EMA"],
-        y=breadth_matrix.index,
-        color_continuous_scale="RdYlGn",
-        text_auto=True,
-        aspect="auto"
-    )
-    fig_breadth.update_layout(height=520, template="plotly_white")
-    st.plotly_chart(fig_breadth, use_container_width=True)
+        fig.update_traces(
+            textposition="top center",
+            marker=dict(size=9, opacity=0.85, line=dict(width=0.5, color="white")),
+        )
 
-# Tab 4: Full Table
-with tabs[3]:
-    st.subheader("Full Watchlist Data Table")
-    display_cols = ["SYMBOL", "SECTOR", "CLOSE", "PCT_CHANGE", "DELIV_QTY", "DSI", "NR7", "MANSFIELD_RS", "Accumulation_Alert"]
+        # Clamped X-axis prevents single outliers from compressing all other 1,151 stocks
+        fig.update_xaxes(
+            title_text="Price Change (%)",
+            range=[p_low, max(p_high, 20.0)],
+            zeroline=True,
+            zerolinecolor="#444",
+            gridcolor="#222",
+        )
+
+        fig.update_yaxes(
+            title_text="Delivery Surge Index (x 50D Avg)",
+            zeroline=True,
+            zerolinecolor="#444",
+            gridcolor="#222",
+        )
+
+        fig.add_hline(
+            y=2.0,
+            line_dash="dash",
+            line_color="rgba(255, 255, 255, 0.4)",
+            annotation_text="DSI 2.0x Threshold",
+            annotation_position="bottom right",
+        )
+
+        fig.update_layout(
+            template="plotly_dark",
+            height=680,
+            margin=dict(l=20, r=20, t=30, b=20),
+            legend=dict(yanchor="top", y=0.98, xanchor="right", x=0.99),
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("No stocks match the selected filter criteria.")
+
+with tab4:
     st.dataframe(
-        filtered_df[display_cols].sort_values(by="DSI", ascending=False).style.format({
-            "CLOSE": "₹{:,.2f}",
-            "PCT_CHANGE": "{:+.2f}%",
-            "DELIV_QTY": "{:,}",
-            "DSI": "{:.2f}x",
-            "MANSFIELD_RS": "{:+.2f}"
-        }),
+        filtered_df[
+            [
+                "SYMBOL",
+                "SERIES",
+                "CLOSE",
+                "Price Change (%)",
+                "Delivery Surge Index (x 50D Avg)",
+                "DELIV_QTY",
+                "Accumulation_Alert",
+            ]
+        ].sort_values(by="Delivery Surge Index (x 50D Avg)", ascending=False),
         use_container_width=True,
-        height=620
     )
