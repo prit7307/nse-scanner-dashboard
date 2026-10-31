@@ -23,52 +23,52 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=300)
 def load_and_process_data():
     file_path = os.path.join("data", "nse_rolling_60d.parquet")
     if not os.path.exists(file_path):
         return pd.DataFrame()
 
     df = pd.read_parquet(file_path)
-    
-    # 1. Normalize headers
     df.columns = [c.strip().upper() for c in df.columns]
 
     sym_col = next((c for c in ['SYMBOL', 'TCKRSYMB', 'STOCK'] if c in df.columns), df.columns[0])
     date_col = next((c for c in ['DATE', 'TIMESTAMP', 'TRADING_DATE', 'DATETIME'] if c in df.columns), None)
     close_col = next((c for c in ['CLOSE', 'CLOSE_PRICE', 'LT_PRICE', 'LTP'] if c in df.columns), None)
+    prevclose_col = next((c for c in ['PREVCLOSE', 'PREV_CLOSE'] if c in df.columns), None)
     deliv_col = next((c for c in ['DELIV_QTY', 'DELIVERY_QTY', 'TTL_TRD_QNTY', 'VOLUME'] if c in df.columns), None)
     high_col = next((c for c in ['HIGH', 'HIGH_PRICE'] if c in df.columns), None)
     low_col = next((c for c in ['LOW', 'LOW_PRICE'] if c in df.columns), None)
 
     df.rename(columns={sym_col: 'SYMBOL'}, inplace=True)
 
-    # Clean numeric fields
-    for col in [close_col, deliv_col, high_col, low_col]:
+    # Filter equity series
+    if 'SERIES' in df.columns:
+        df = df[df['SERIES'].isin(['EQ', 'BE'])]
+
+    for col in [close_col, prevclose_col, deliv_col, high_col, low_col]:
         if col:
             df[col] = pd.to_numeric(df[col], errors='coerce')
 
     if date_col:
-        # CRITICAL FIX 1: Enforce dayfirst=True to handle Indian DD-MM-YYYY format accurately
         df[date_col] = pd.to_datetime(df[date_col], format='mixed', dayfirst=True)
-
-        # CRITICAL FIX 2: Deduplicate (SYMBOL, DATE) so multiple runs don't corrupt shift(1)
         df = df.drop_duplicates(subset=['SYMBOL', date_col], keep='last')
-
-        # CRITICAL FIX 3: Sort strictly ascending chronologically per symbol
         df = df.sort_values(by=['SYMBOL', date_col], ascending=[True, True])
 
-        # Compute true 1-day session price change: (Today Close - Yesterday Close) / Yesterday Close
-        if close_col:
-            df['PREV_SESSION_CLOSE'] = df.groupby('SYMBOL')[close_col].shift(1)
-            valid_base = (df['PREV_SESSION_CLOSE'] > 0.05) & df['PREV_SESSION_CLOSE'].notna()
-            df['Price Change (%)'] = np.where(
-                valid_base,
-                ((df[close_col] - df['PREV_SESSION_CLOSE']) / df['PREV_SESSION_CLOSE']) * 100.0,
-                0.0
-            )
+        # 1. FORCE CALCULATION of 1-day session price change (bypassing any corrupted pre-saved columns)
+        if prevclose_col and prevclose_col in df.columns and df[prevclose_col].notna().sum() > len(df) * 0.5:
+            base_col = df[prevclose_col]
+        else:
+            base_col = df.groupby('SYMBOL')[close_col].shift(1)
 
-        # Compute rolling 50-day SMA delivery & DSI
+        valid_base = (base_col > 0.05) & (base_col.notna())
+        df['Price Change (%)'] = np.where(
+            valid_base,
+            ((df[close_col] - base_col) / base_col) * 100.0,
+            0.0
+        )
+
+        # 2. Compute Delivery 50SMA and DSI
         if deliv_col:
             df['DELIV_50SMA'] = df.groupby('SYMBOL')[deliv_col].transform(
                 lambda x: x.rolling(50, min_periods=1).mean()
@@ -79,17 +79,14 @@ def load_and_process_data():
                 1.0
             )
 
-        # Filter strictly to the latest trading day in the dataset
+        # Filter strictly to the latest trading session
         latest_date = df[date_col].max()
         latest_df = df[df[date_col] == latest_date].copy()
     else:
         latest_df = df.copy()
+        if 'Price Change (%)' not in latest_df.columns:
+            latest_df['Price Change (%)'] = 0.0
 
-    # Column mappings & fallbacks
-    if 'Price Change (%)' not in latest_df.columns:
-        latest_df['Price Change (%)'] = 0.0
-    if 'Delivery Surge Index (x 50D Avg)' not in latest_df.columns:
-        latest_df['Delivery Surge Index (x 50D Avg)'] = 1.0
     if close_col and 'CLOSE' not in latest_df.columns:
         latest_df['CLOSE'] = latest_df[close_col]
     if deliv_col and 'DELIV_QTY' not in latest_df.columns:
@@ -99,8 +96,8 @@ def load_and_process_data():
     latest_df['Delivery Surge Index (x 50D Avg)'] = latest_df['Delivery Surge Index (x 50D Avg)'].fillna(1.0)
     latest_df['DELIV_QTY'] = latest_df['DELIV_QTY'].fillna(0)
 
-    # Anomaly clamping: prevent outlier visual distortion without deleting rows
-    latest_df['Price Change (%)'] = latest_df['Price Change (%)'].clip(lower=-30.0, upper=30.0)
+    # Clamp price change display safely to real exchange circuit boundaries (-20% to +20%)
+    latest_df['Price Change (%)'] = latest_df['Price Change (%)'].clip(lower=-20.0, upper=20.0)
 
     # Accumulation Alert
     latest_df['Accumulation_Alert'] = np.where(
@@ -109,11 +106,11 @@ def load_and_process_data():
         'NEUTRAL'
     )
 
-    # Sector Master merge
-    sector_path = "nse_sector_master.csv"
-    if os.path.exists(sector_path) and 'SECTOR' not in latest_df.columns:
+    # Merge Sectors
+    sector_file = "nse_sector_master.csv"
+    if os.path.exists(sector_file) and 'SECTOR' not in latest_df.columns:
         try:
-            sec_df = pd.read_csv(sector_path)
+            sec_df = pd.read_csv(sector_file)
             sec_df.columns = [c.strip().upper() for c in sec_df.columns]
             if 'SYMBOL' in sec_df.columns and 'SECTOR' in sec_df.columns:
                 latest_df = pd.merge(latest_df, sec_df[['SYMBOL', 'SECTOR']], on='SYMBOL', how='left')
@@ -125,7 +122,7 @@ def load_and_process_data():
     else:
         latest_df['SECTOR'] = latest_df['SECTOR'].fillna('Broad Market / Small & Mid')
 
-    # NR7 Volatility Squeeze
+    # NR7 Volatility Squeeze calculation
     if 'IS_NR7' not in latest_df.columns:
         if high_col and low_col and close_col:
             rng = latest_df[high_col] - latest_df[low_col]
@@ -218,7 +215,6 @@ with tab1:
             marker=dict(size=8, opacity=0.8, line=dict(width=0.5, color='white'))
         )
 
-        # Dynamic viewport centered across true single-day returns
         pct_values = filtered_df['Price Change (%)'].dropna()
         p_low = max(-15.0, float(np.percentile(pct_values, 1))) if len(pct_values) > 10 else -5.0
         p_high = min(20.0, float(np.percentile(pct_values, 99)) + 1.0) if len(pct_values) > 10 else 10.0
