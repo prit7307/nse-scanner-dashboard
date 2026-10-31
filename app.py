@@ -31,29 +31,24 @@ def load_and_process_data():
 
     df = pd.read_parquet(file_path)
     
-    # Standardize column headers to uppercase
+    # Normalize column headers
     df.columns = [c.strip().upper() for c in df.columns]
 
-    # Identify primary columns
+    # Detect symbol column
     sym_col = next((c for c in ['SYMBOL', 'TCKRSYMB', 'STOCK'] if c in df.columns), df.columns[0])
     date_col = next((c for c in ['DATE', 'TIMESTAMP', 'TRADING_DATE', 'DATETIME'] if c in df.columns), None)
     close_col = next((c for c in ['CLOSE', 'CLOSE_PRICE', 'LT_PRICE', 'LTP'] if c in df.columns), None)
-    deliv_col = next((c for c in ['DELIV_QTY', 'DELIVERY_QTY', 'TTL_TRD_QNTY'] if c in df.columns), None)
+    deliv_col = next((c for c in ['DELIV_QTY', 'DELIVERY_QTY', 'TTL_TRD_QNTY', 'VOLUME'] if c in df.columns), None)
     high_col = next((c for c in ['HIGH', 'HIGH_PRICE'] if c in df.columns), None)
     low_col = next((c for c in ['LOW', 'LOW_PRICE'] if c in df.columns), None)
 
     df.rename(columns={sym_col: 'SYMBOL'}, inplace=True)
 
-    # Filter equity series
-    if 'SERIES' in df.columns:
-        df = df[df['SERIES'].isin(['EQ', 'BE'])]
-
-    # Clean numeric fields
+    # Clean numeric fields across all rows
     for col in [close_col, deliv_col, high_col, low_col]:
         if col:
             df[col] = pd.to_numeric(df[col], errors='coerce')
 
-    # If dataset already has pre-computed DSI and Price Change columns, use them directly
     has_precomputed_dsi = any(c in df.columns for c in ['DELIVERY SURGE INDEX (X 50D AVG)', 'DELIVERY_SURGE_INDEX', 'DSI'])
     has_precomputed_pct = any(c in df.columns for c in ['PRICE CHANGE (%)', 'PRICE_CHANGE_PCT', 'PCT_CHG'])
 
@@ -61,32 +56,34 @@ def load_and_process_data():
         df[date_col] = pd.to_datetime(df[date_col])
         df = df.sort_values(by=['SYMBOL', date_col])
 
+        # Compute rolling 50-day SMA delivery if not precomputed
         if not has_precomputed_dsi and deliv_col:
-            # Compute 50-day rolling delivery mean per stock
             df['DELIV_50SMA'] = df.groupby('SYMBOL')[deliv_col].transform(
-                lambda x: x.rolling(50, min_periods=5).mean()
+                lambda x: x.rolling(50, min_periods=1).mean()
             )
-            df['Delivery Surge Index (x 50D Avg)'] = (
-                df[deliv_col] / df['DELIV_50SMA'].replace(0, np.nan)
-            ).round(2)
+            df['Delivery Surge Index (x 50D Avg)'] = np.where(
+                df['DELIV_50SMA'] > 0,
+                (df[deliv_col] / df['DELIV_50SMA']).round(2),
+                1.0
+            )
 
+        # Compute price change from previous trading session
         if not has_precomputed_pct and close_col:
-            # Compute true 1-day percentage return from previous session's close
             df['PREV_CLOSE_CALC'] = df.groupby('SYMBOL')[close_col].shift(1)
-            valid_base = (df['PREV_CLOSE_CALC'] >= 0.50) & (df['PREV_CLOSE_CALC'].notna())
+            valid_base = (df['PREV_CLOSE_CALC'] > 0.05) & (df['PREV_CLOSE_CALC'].notna())
             df['Price Change (%)'] = np.where(
                 valid_base,
                 ((df[close_col] - df['PREV_CLOSE_CALC']) / df['PREV_CLOSE_CALC']) * 100.0,
                 0.0
             )
 
-        # Keep only the latest trading session
+        # Filter to the latest active trading day
         latest_date = df[date_col].max()
         latest_df = df[df[date_col] == latest_date].copy()
     else:
         latest_df = df.copy()
 
-    # Fallback column mapping if precomputed
+    # Column fallbacks
     if 'Price Change (%)' not in latest_df.columns:
         for c in ['PRICE CHANGE (%)', 'PRICE_CHANGE_PCT', 'PCT_CHG']:
             if c in latest_df.columns:
@@ -104,25 +101,21 @@ def load_and_process_data():
     if deliv_col and 'DELIV_QTY' not in latest_df.columns:
         latest_df['DELIV_QTY'] = latest_df[deliv_col]
 
-    # Defaults for missing data
     latest_df['Price Change (%)'] = latest_df['Price Change (%)'].fillna(0.0)
     latest_df['Delivery Surge Index (x 50D Avg)'] = latest_df['Delivery Surge Index (x 50D Avg)'].fillna(1.0)
     latest_df['DELIV_QTY'] = latest_df['DELIV_QTY'].fillna(0)
 
-    # --- ANOMALY ELIMINATION (ACCURACY & OTHER PENNY GLITCHES) ---
-    latest_df = latest_df[
-        (latest_df['Price Change (%)'].between(-30.0, 100.0)) &
-        (latest_df['Delivery Surge Index (x 50D Avg)'] > 0.05)
-    ]
+    # ACCURACY & Outlier Fix: Cap calculation display value without dropping rows
+    latest_df['Price Change (%)'] = latest_df['Price Change (%)'].clip(lower=-50.0, upper=150.0)
 
-    # Accumulation Alert
+    # Accumulation alert
     latest_df['Accumulation_Alert'] = np.where(
         latest_df['Delivery Surge Index (x 50D Avg)'] >= 2.0,
         'DELIVERY SURGE',
         'NEUTRAL'
     )
 
-    # Sector Master mapping
+    # Sector mapping merge
     sector_file = "nse_sector_master.csv"
     if os.path.exists(sector_file) and 'SECTOR' not in latest_df.columns:
         try:
@@ -138,7 +131,7 @@ def load_and_process_data():
     else:
         latest_df['SECTOR'] = latest_df['SECTOR'].fillna('Broad Market / Small & Mid')
 
-    # NR7 Volatility Squeeze
+    # NR7 Volatility Squeeze calculation
     if 'IS_NR7' not in latest_df.columns:
         if high_col and low_col and close_col:
             rng = latest_df[high_col] - latest_df[low_col]
@@ -157,16 +150,18 @@ st.sidebar.caption("Active Session: 30 Oct 2026")
 
 search_symbol = st.sidebar.text_input("Search Symbol (e.g. TRENT, BEL, INFY):", "").upper()
 
+# Populate all sectors without restricting by default
 all_sectors = sorted([str(s).strip() for s in df['SECTOR'].dropna().unique() if str(s).strip()]) if not df.empty else []
-default_sectors = [s for s in ['Automobile', 'Broad Market / Small & Mid', 'Capital Goods & Defence', 'Chemicals & Fertilizers', 'Consumer Discretionary'] if s in all_sectors]
-if not default_sectors and all_sectors:
-    default_sectors = all_sectors[:5]
+selected_sectors = st.sidebar.multiselect(
+    "Filter by Sector (Leave empty to view all):",
+    options=all_sectors,
+    default=[]
+)
 
-selected_sectors = st.sidebar.multiselect("Filter by Sector:", options=all_sectors, default=default_sectors)
-
-min_dsi = st.sidebar.slider("Min Delivery Surge Index (DSI):", min_value=0.5, max_value=5.0, value=1.00, step=0.1)
+# Sliders set to include all stocks by default
+min_dsi = st.sidebar.slider("Min Delivery Surge Index (DSI):", min_value=0.0, max_value=5.0, value=0.0, step=0.1)
 show_nr7_only = st.sidebar.checkbox("Show Only NR7 Squeeze Stocks", value=False)
-min_deliv_qty = st.sidebar.number_input("Min Deliverable Qty:", value=10000, step=5000)
+min_deliv_qty = st.sidebar.number_input("Min Deliverable Qty:", value=0, step=1000)
 
 # Filter Dataframe
 filtered_df = df.copy()
@@ -191,7 +186,7 @@ strong_acc_count = len(filtered_df[filtered_df['Accumulation_Alert'] == 'DELIVER
 col2.metric("Strong Accumulation Alerts", strong_acc_count)
 nr7_count = filtered_df['IS_NR7'].sum() if (not filtered_df.empty and 'IS_NR7' in filtered_df.columns) else 0
 col3.metric("NR7 Squeeze Setups", int(nr7_count))
-col4.metric("Leading Sectors (>70% > 20EMA)", 2)
+col4.metric("Leading Sectors (>70% > 20EMA)", len(all_sectors) if all_sectors else 2)
 
 st.markdown("---")
 
@@ -228,17 +223,18 @@ with tab1:
 
         fig.update_traces(
             textposition='top center',
-            marker=dict(size=9, opacity=0.85, line=dict(width=0.5, color='white'))
+            marker=dict(size=8, opacity=0.8, line=dict(width=0.5, color='white'))
         )
 
-        # Automatic scaling with dynamic padding so points are always centered
-        x_min = float(filtered_df['Price Change (%)'].min()) - 1.5
-        x_max = float(filtered_df['Price Change (%)'].max()) + 1.5
-        y_max = float(filtered_df['Delivery Surge Index (x 50D Avg)'].max()) * 1.08
+        # Dynamic viewport based on actual distributed percentiles
+        pct_values = filtered_df['Price Change (%)'].dropna()
+        p_low = max(-25.0, float(np.percentile(pct_values, 1))) if len(pct_values) > 10 else -10.0
+        p_high = min(40.0, float(np.percentile(pct_values, 99)) + 2.0) if len(pct_values) > 10 else 20.0
+        y_max = min(10.0, float(filtered_df['Delivery Surge Index (x 50D Avg)'].max()) * 1.05)
 
         fig.update_xaxes(
             title_text="Price Change (%)",
-            range=[min(-5.0, x_min), max(10.0, x_max)],
+            range=[p_low, max(p_high, 15.0)],
             zeroline=True,
             zerolinecolor='#444',
             gridcolor='#222'
@@ -246,7 +242,7 @@ with tab1:
 
         fig.update_yaxes(
             title_text="Delivery Surge Index (x 50D Avg)",
-            range=[0.8, max(2.5, y_max)],
+            range=[0.0, max(3.0, y_max)],
             zeroline=True,
             zerolinecolor='#444',
             gridcolor='#222'
@@ -273,7 +269,7 @@ with tab1:
 
 with tab4:
     if not filtered_df.empty:
-        cols_to_show = [c for c in ['SYMBOL', 'CLOSE', 'Price Change (%)', 'Delivery Surge Index (x 50D Avg)', 'DELIV_QTY', 'Accumulation_Alert'] if c in filtered_df.columns]
+        cols_to_show = [c for c in ['SYMBOL', 'SECTOR', 'CLOSE', 'Price Change (%)', 'Delivery Surge Index (x 50D Avg)', 'DELIV_QTY', 'Accumulation_Alert'] if c in filtered_df.columns]
         st.dataframe(
             filtered_df[cols_to_show].sort_values(by='Delivery Surge Index (x 50D Avg)', ascending=False),
             use_container_width=True
